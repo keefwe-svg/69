@@ -1,0 +1,20 @@
+name: Duels
+version: 1.0.0
+main: ru.matvey.duels.DuelsPlugin
+api-version: '26.2'
+author: Matvey
+description: PvP duels, kits, arenas and parties
+
+commands:
+  duel:
+    description: Main Duels command
+    usage: /duel
+    aliases: [duels]
+  party:
+    description: Party management
+    usage: /party
+
+permissions:
+  duels.admin:
+    description: Administrative Duels commands
+    default: op

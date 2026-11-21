@@ -1,0 +1,1068 @@
+package ru.matvey.duels;
+
+import net.kyori.adventure.text.Component;
+import net.kyori.adventure.text.format.NamedTextColor;
+import net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer;
+import org.bukkit.*;
+import org.bukkit.command.*;
+import org.bukkit.configuration.ConfigurationSection;
+import org.bukkit.configuration.file.YamlConfiguration;
+import org.bukkit.entity.Player;
+import org.bukkit.entity.ArmorStand;
+import org.bukkit.entity.Entity;
+import org.bukkit.event.*;
+import org.bukkit.event.inventory.*;
+import org.bukkit.event.player.PlayerDropItemEvent;
+import org.bukkit.event.player.PlayerQuitEvent;
+import org.bukkit.event.entity.PlayerDeathEvent;
+import org.bukkit.inventory.*;
+import org.bukkit.inventory.meta.ItemMeta;
+import org.bukkit.plugin.java.JavaPlugin;
+
+import java.io.File;
+import java.io.IOException;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+
+public final class DuelsPlugin extends JavaPlugin implements Listener, CommandExecutor, TabCompleter {
+
+    private final Map<String, Arena> arenas = new LinkedHashMap<>();
+    private final Map<UUID, Party> parties = new HashMap<>();
+    private final Map<UUID, UUID> partyByPlayer = new HashMap<>();
+    private final Map<String, Deque<QueueEntry>> queues = new HashMap<>();
+    private final Map<Integer, Location> partySpawnpoints = new TreeMap<>();
+    private final Map<UUID, String> selectedKit = new HashMap<>();
+    private File arenasFile, partySpawnsFile, statsFile, hologramsFile, kitsFolder;
+    private final Map<String, KitData> kits = new LinkedHashMap<>();
+    private final Map<UUID, String> editingKits = new HashMap<>();
+    private final Map<UUID, PlayerStats> stats = new HashMap<>();
+    private final Map<String, Location> holograms = new LinkedHashMap<>();
+    private final Map<UUID, Match> activeMatches = new HashMap<>();
+    private final Map<String, List<UUID>> hologramEntities = new HashMap<>();
+
+    private static final String MENU_TITLE = "DUELS » Выбор кита";
+    private static final String EDITOR_PREFIX = "DUELS » Редактор: ";
+    private static final String COMPASS_TAG = "§5Компас дуэлей";
+
+
+
+    @Override
+    public void onEnable() {
+        saveDefaultConfig();
+        arenasFile = new File(getDataFolder(), "arenas.yml");
+        partySpawnsFile = new File(getDataFolder(), "party-spawns.yml");
+        statsFile = new File(getDataFolder(), "stats.yml");
+        hologramsFile = new File(getDataFolder(), "holograms.yml");
+        kitsFolder = new File(getDataFolder(), "kits");
+        if (!kitsFolder.exists()) kitsFolder.mkdirs();
+        loadKits();
+        loadArenas();
+        loadPartySpawnpoints();
+        loadStats();
+        loadHolograms();
+        Objects.requireNonNull(getCommand("duel")).setExecutor(this);
+        Objects.requireNonNull(getCommand("duel")).setTabCompleter(this);
+        Objects.requireNonNull(getCommand("party")).setExecutor(this);
+        Objects.requireNonNull(getCommand("party")).setTabCompleter(this);
+        getServer().getPluginManager().registerEvents(this, this);
+        getLogger().info("Duels enabled.");
+    }
+
+    @Override
+    public void onDisable() {
+        saveArenas();
+        savePartySpawnpoints();
+        saveStats();
+        saveHolograms();
+        for (String id : kits.keySet()) saveKit(kits.get(id));
+    }
+
+    // ---------------- Commands ----------------
+
+    @Override
+    public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
+        if (command.getName().equalsIgnoreCase("duel")) return duelCommand(sender, args);
+        if (command.getName().equalsIgnoreCase("party")) return partyCommand(sender, args);
+        return true;
+    }
+
+    private boolean duelCommand(CommandSender sender, String[] args) {
+        if (args.length == 0) {
+            sender.sendMessage("§d§lDuels §7— §fкоманды:");
+            sender.sendMessage("§d/duel menu §7— открыть меню китов");
+            sender.sendMessage("§d/duel cancel §7— отменить поиск");
+            sender.sendMessage("§d/duel stats [ник] §7— статистика");
+            sender.sendMessage("§d/duel top <kills|deaths|wins> §7— таблица лидеров");
+            if (sender.isOp()) {
+                sender.sendMessage("§d/duel give compass §7— получить компас");
+                sender.sendMessage("§d/duel compas del §7— убрать компас");
+                sender.sendMessage("§d/duel kit create <название>");
+                sender.sendMessage("§d/duel kit open <название>");
+                sender.sendMessage("§d/duel kit delete <название>");
+                sender.sendMessage("§d/duel kit list");
+                sender.sendMessage("§d/duel create area <название>");
+                sender.sendMessage("§d/duel addspawnpoint <название>");
+                sender.sendMessage("§d/duel delete area <название>");
+                sender.sendMessage("§d/duel list");
+                sender.sendMessage("§d/duel hologram add <kills|deaths|wins>");
+                sender.sendMessage("§d/duel hologram delete §7— удалить ближайшую голограмму");
+            }
+            return true;
+        }
+
+        switch (args[0].toLowerCase(Locale.ROOT)) {
+            case "kit" -> {
+                if (!sender.isOp()) return noPermission(sender);
+                if (args.length < 2) { sender.sendMessage("§cИспользование: /duel kit <create|open|delete|list> [название]"); return true; }
+                String action = args[1].toLowerCase(Locale.ROOT);
+                if (action.equals("list")) {
+                    sender.sendMessage("§c§lDUELS §8» §fКиты: §7" + (kits.isEmpty() ? "нет" : String.join(", ", kits.keySet())));
+                    return true;
+                }
+                if (args.length != 3) { sender.sendMessage("§cУкажи название кита."); return true; }
+                String id = args[2].toLowerCase(Locale.ROOT).replaceAll("[^a-z0-9_-]", "");
+                if (id.isBlank()) { sender.sendMessage("§cНекорректное название."); return true; }
+                if (action.equals("create")) {
+                    if (kits.containsKey(id)) { sender.sendMessage("§cТакой кит уже существует."); return true; }
+                    KitData data = new KitData(id); kits.put(id, data); saveKit(data);
+                    sender.sendMessage("§aКит §f" + id + " §aсоздан. Открой его: /duel kit open " + id);
+                } else if (action.equals("open")) {
+                    if (!(sender instanceof Player player)) return playerOnly(sender);
+                    KitData data = kits.get(id);
+                    if (data == null) { sender.sendMessage("§cКит не найден."); return true; }
+                    openKitEditor(player, data);
+                } else if (action.equals("delete")) {
+                    KitData removed = kits.remove(id);
+                    if (removed == null) sender.sendMessage("§cКит не найден.");
+                    else { File file = new File(kitsFolder, id + ".yml"); if (file.exists()) file.delete(); sender.sendMessage("§aКит удалён."); }
+                } else sender.sendMessage("§cНеизвестное действие.");
+            }
+            case "compas" -> {
+                if (!(sender instanceof Player player)) return playerOnly(sender);
+                if (args.length != 2 || !args[1].equalsIgnoreCase("del")) { sender.sendMessage("§cИспользование: /duel compas del"); return true; }
+                int removed = 0;
+                for (int i = 0; i < player.getInventory().getSize(); i++) {
+                    ItemStack stack = player.getInventory().getItem(i);
+                    if (stack != null && isCompass(stack)) { player.getInventory().setItem(i, null); removed += stack.getAmount(); }
+                }
+                player.sendMessage(removed > 0 ? "§aКомпас удалён." : "§cУ тебя нет компаса.");
+            }
+            case "menu" -> {
+                if (!(sender instanceof Player p)) return playerOnly(sender);
+                openKitMenu(p);
+            }
+            case "cancel" -> {
+                if (!(sender instanceof Player p)) return playerOnly(sender);
+                removeFromQueues(p.getUniqueId());
+                p.sendMessage("§cПоиск дуэли отменён.");
+            }
+            case "stats" -> {
+                if (!(sender instanceof Player viewer) && args.length < 2) return playerOnly(sender);
+                OfflinePlayer target = args.length >= 2 ? Bukkit.getOfflinePlayer(args[1]) : Bukkit.getOfflinePlayer(((Player) sender).getUniqueId());
+                PlayerStats st = stats.getOrDefault(target.getUniqueId(), new PlayerStats());
+                String name = target.getName() == null ? "Unknown" : target.getName();
+                sender.sendMessage("§d§lСтатистика §8— §f" + name);
+                sender.sendMessage("§aУбийства: §f" + st.kills);
+                sender.sendMessage("§cСмерти: §f" + st.deaths);
+                sender.sendMessage("§6Победы: §f" + st.wins);
+            }
+            case "top" -> {
+                if (args.length != 2 || !List.of("kills", "deaths", "wins").contains(args[1].toLowerCase(Locale.ROOT))) {
+                    sender.sendMessage("§cИспользование: /duel top <kills|deaths|wins>");
+                    return true;
+                }
+                showTop(sender, args[1].toLowerCase(Locale.ROOT));
+            }
+            case "hologram" -> {
+                if (!sender.isOp()) return noPermission(sender);
+                if (!(sender instanceof Player p)) return playerOnly(sender);
+                if (args.length == 2 && args[1].equalsIgnoreCase("delete")) {
+                    String nearestId = null;
+                    double nearestDistance = 25.0;
+                    for (Map.Entry<String, Location> entry : holograms.entrySet()) {
+                        Location loc = entry.getValue();
+                        if (loc.getWorld() == null || !loc.getWorld().equals(p.getWorld())) continue;
+                        double distance = loc.distanceSquared(p.getLocation());
+                        if (distance <= nearestDistance) {
+                            nearestDistance = distance;
+                            nearestId = entry.getKey();
+                        }
+                    }
+                    if (nearestId == null) {
+                        p.sendMessage("§cРядом нет голограмм (радиус 5 блоков).");
+                        return true;
+                    }
+                    List<UUID> entityIds = hologramEntities.remove(nearestId);
+                    if (entityIds != null) for (UUID entityId : entityIds) {
+                        Entity entity = Bukkit.getEntity(entityId);
+                        if (entity != null) entity.remove();
+                    }
+                    holograms.remove(nearestId);
+                    saveHolograms();
+                    p.sendMessage("§aБлижайшая голограмма удалена.");
+                    return true;
+                }
+                if (args.length != 3 || !args[1].equalsIgnoreCase("add")
+                        || !List.of("kills", "deaths", "wins").contains(args[2].toLowerCase(Locale.ROOT))) {
+                    sender.sendMessage("§cИспользование: /duel hologram add <kills|deaths|wins> или /duel hologram delete");
+                    return true;
+                }
+                String type = args[2].toLowerCase(Locale.ROOT);
+                String id = type + "_" + System.currentTimeMillis();
+                // Точка игрока — нижняя строка голограммы; остальные строки идут вверх.
+                holograms.put(id, p.getLocation().clone());
+                saveHolograms();
+                refreshHologram(id, type);
+                p.sendMessage("§aГолограмма §f" + hologramTypeName(type) + " §aсоздана снизу вверх.");
+            }
+            case "give" -> {
+                if (!sender.isOp()) return noPermission(sender);
+                if (args.length < 2 || !args[1].equalsIgnoreCase("compass")) {
+                    sender.sendMessage("§cИспользование: /duel give compass");
+                    return true;
+                }
+                if (!(sender instanceof Player p)) return playerOnly(sender);
+                p.getInventory().addItem(createCompass());
+                p.sendMessage("§aКомпас дуэлей выдан.");
+            }
+            case "create" -> {
+                if (!sender.isOp()) return noPermission(sender);
+                if (args.length != 3 || !args[1].equalsIgnoreCase("area")) {
+                    sender.sendMessage("§cИспользование: /duel create area <название>");
+                    return true;
+                }
+                String name = args[2].toLowerCase(Locale.ROOT);
+                if (arenas.containsKey(name)) {
+                    sender.sendMessage("§cАрена с таким названием уже существует.");
+                    return true;
+                }
+                arenas.put(name, new Arena(name));
+                saveArenas();
+                sender.sendMessage("§aАрена §f" + name + " §aсоздана. Добавь точки командой /duel addspawnpoint " + name);
+            }
+            case "addspawnpoint" -> {
+                if (!sender.isOp()) return noPermission(sender);
+                if (!(sender instanceof Player p)) return playerOnly(sender);
+                if (args.length != 2) {
+                    sender.sendMessage("§cИспользование: /duel addspawnpoint <название>");
+                    return true;
+                }
+                Arena arena = arenas.get(args[1].toLowerCase(Locale.ROOT));
+                if (arena == null) {
+                    sender.sendMessage("§cАрена не найдена.");
+                    return true;
+                }
+                arena.spawns.add(p.getLocation().clone());
+                saveArenas();
+                sender.sendMessage("§aТочка " + arena.spawns.size() + " добавлена на арену §f" + arena.name + "§a.");
+            }
+            case "delete" -> {
+                if (!sender.isOp()) return noPermission(sender);
+                if (args.length != 3 || !args[1].equalsIgnoreCase("area")) {
+                    sender.sendMessage("§cИспользование: /duel delete area <название>");
+                    return true;
+                }
+                Arena removed = arenas.remove(args[2].toLowerCase(Locale.ROOT));
+                if (removed == null) sender.sendMessage("§cАрена не найдена.");
+                else {
+                    saveArenas();
+                    sender.sendMessage("§aАрена удалена.");
+                }
+            }
+            case "list" -> {
+                if (arenas.isEmpty()) sender.sendMessage("§7Арен пока нет.");
+                else {
+                    sender.sendMessage("§d§lАрены:");
+                    for (Arena a : arenas.values())
+                        sender.sendMessage("§f" + a.name + " §8— §7точек: " + a.spawns.size() + (a.busy ? " §c(занята)" : " §a(свободна)"));
+                }
+            }
+            default -> sender.sendMessage("§cНеизвестная команда. Напиши /duel для подсказки.");
+        }
+        return true;
+    }
+
+    private boolean partyCommand(CommandSender sender, String[] args) {
+        if (!(sender instanceof Player p)) return playerOnly(sender);
+        if (args.length == 0) {
+            sendPartyHelp(p);
+            return true;
+        }
+        String sub = args[0].toLowerCase(Locale.ROOT);
+        switch (sub) {
+            case "create" -> {
+                if (partyByPlayer.containsKey(p.getUniqueId())) {
+                    p.sendMessage("§cТы уже состоишь в Party.");
+                    return true;
+                }
+                Party party = new Party(p.getUniqueId());
+                parties.put(party.id, party);
+                partyByPlayer.put(p.getUniqueId(), party.id);
+                p.sendMessage("§aParty создана. Ты её лидер.");
+            }
+            case "invite" -> {
+                if (args.length != 2) { p.sendMessage("§c/party invite <ник>"); return true; }
+                Party party = getParty(p);
+                if (party == null || !party.leader.equals(p.getUniqueId())) { p.sendMessage("§cТолько лидер Party может приглашать."); return true; }
+                Player target = Bukkit.getPlayerExact(args[1]);
+                if (target == null) { p.sendMessage("§cИгрок не найден или не в сети."); return true; }
+                if (partyByPlayer.containsKey(target.getUniqueId())) { p.sendMessage("§cЭтот игрок уже состоит в Party."); return true; }
+                party.invites.put(target.getUniqueId(), System.currentTimeMillis() + 60_000L);
+                target.sendMessage("§d" + p.getName() + " §fприглашает тебя в Party. §a/party accept " + p.getName() + " §7(60 секунд)");
+                p.sendMessage("§aПриглашение отправлено игроку §f" + target.getName());
+            }
+            case "accept" -> {
+                if (args.length != 2) { p.sendMessage("§c/party accept <ник-лидера>"); return true; }
+                UUID leaderId = findOnlineUuid(args[1]);
+                Party party = leaderId == null ? null : getPartyByPlayer(leaderId);
+                if (party == null || !Objects.equals(party.invites.get(p.getUniqueId()), null) && party.invites.get(p.getUniqueId()) < System.currentTimeMillis()) {
+                    p.sendMessage("§cПриглашение не найдено или истекло.");
+                    return true;
+                }
+                if (partyByPlayer.containsKey(p.getUniqueId())) { p.sendMessage("§cТы уже в Party."); return true; }
+                int max = getConfig().getInt("party-max-size", 8);
+                if (party.members.size() >= max) { p.sendMessage("§cParty заполнена."); return true; }
+                party.invites.remove(p.getUniqueId());
+                party.members.add(p.getUniqueId());
+                partyByPlayer.put(p.getUniqueId(), party.id);
+                broadcast(party, "§a" + p.getName() + " присоединился к Party.");
+            }
+            case "deny" -> {
+                if (args.length != 2) { p.sendMessage("§c/party deny <ник-лидера>"); return true; }
+                UUID leaderId = findOnlineUuid(args[1]);
+                Party party = leaderId == null ? null : getPartyByPlayer(leaderId);
+                if (party != null) party.invites.remove(p.getUniqueId());
+                p.sendMessage("§7Приглашение отклонено.");
+            }
+            case "leave" -> leaveParty(p);
+            case "kick" -> {
+                if (args.length != 2) { p.sendMessage("§c/party kick <ник>"); return true; }
+                Party party = getParty(p);
+                if (party == null || !party.leader.equals(p.getUniqueId())) { p.sendMessage("§cТолько лидер может исключать участников."); return true; }
+                Player target = Bukkit.getPlayerExact(args[1]);
+                if (target == null || !party.members.contains(target.getUniqueId()) || target.getUniqueId().equals(party.leader)) { p.sendMessage("§cУчастник не найден."); return true; }
+                party.members.remove(target.getUniqueId());
+                partyByPlayer.remove(target.getUniqueId());
+                target.sendMessage("§cТебя исключили из Party.");
+                broadcast(party, "§e" + target.getName() + " исключён из Party.");
+            }
+            case "promote" -> {
+                if (args.length != 2) { p.sendMessage("§c/party promote <ник>"); return true; }
+                Party party = getParty(p);
+                Player target = Bukkit.getPlayerExact(args[1]);
+                if (party == null || !party.leader.equals(p.getUniqueId()) || target == null || !party.members.contains(target.getUniqueId())) {
+                    p.sendMessage("§cНужно быть лидером и указать участника Party.");
+                    return true;
+                }
+                party.leader = target.getUniqueId();
+                broadcast(party, "§e" + target.getName() + " теперь лидер Party.");
+            }
+            case "disband", "delete" -> {
+                Party party = getParty(p);
+                if (party == null || !party.leader.equals(p.getUniqueId())) { p.sendMessage("§cТолько лидер может распустить Party."); return true; }
+                for (UUID member : party.members) partyByPlayer.remove(member);
+                parties.remove(party.id);
+                p.sendMessage("§cParty распущена.");
+            }
+            case "list" -> {
+                Party party = getParty(p);
+                if (party == null) { p.sendMessage("§cТы не состоишь в Party."); return true; }
+                p.sendMessage("§d§lParty §7(" + party.members.size() + "/" + getConfig().getInt("party-max-size", 8) + ")");
+                for (UUID member : party.members) {
+                    OfflinePlayer op = Bukkit.getOfflinePlayer(member);
+                    p.sendMessage((member.equals(party.leader) ? "§d★ " : "§7• ") + "§f" + (op.getName() == null ? member : op.getName()));
+                }
+            }
+            case "add" -> {
+                if (!p.isOp()) return noPermission(p);
+                if (args.length != 3 || !args[1].equalsIgnoreCase("spawnpoint")) {
+                    p.sendMessage("§cИспользование: /party add spawnpoint <номер>");
+                    return true;
+                }
+                int number;
+                try { number = Integer.parseInt(args[2]); } catch (NumberFormatException ex) { p.sendMessage("§cНомер должен быть числом."); return true; }
+                if (number < 1 || number > 64) { p.sendMessage("§cНомер должен быть от 1 до 64."); return true; }
+                partySpawnpoints.put(number, p.getLocation().clone());
+                savePartySpawnpoints();
+                p.sendMessage("§aParty-спавн №" + number + " сохранён.");
+            }
+            case "removespawnpoint" -> {
+                if (!p.isOp() || args.length != 2) { p.sendMessage("§c/party removespawnpoint <номер> (OP)"); return true; }
+                try {
+                    int n = Integer.parseInt(args[1]);
+                    partySpawnpoints.remove(n);
+                    savePartySpawnpoints();
+                    p.sendMessage("§aТочка удалена.");
+                } catch (NumberFormatException ex) { p.sendMessage("§cНомер должен быть числом."); }
+            }
+            default -> sendPartyHelp(p);
+        }
+        return true;
+    }
+
+    private void sendPartyHelp(Player p) {
+        p.sendMessage("§d§lParty §7— команды:");
+        p.sendMessage("§d/party create §7— создать группу");
+        p.sendMessage("§d/party invite <ник> §7— пригласить");
+        p.sendMessage("§d/party accept <лидер> §7— принять приглашение");
+        p.sendMessage("§d/party deny <лидер> §7— отклонить");
+        p.sendMessage("§d/party kick <ник> §7— исключить (лидер)");
+        p.sendMessage("§d/party promote <ник> §7— передать лидерство");
+        p.sendMessage("§d/party leave §7— выйти");
+        p.sendMessage("§d/party list §7— список участников");
+        p.sendMessage("§d/party disband §7— распустить");
+        if (p.isOp()) {
+            p.sendMessage("§d/party add spawnpoint <номер> §7— сохранить точку");
+            p.sendMessage("§d/party removespawnpoint <номер>");
+        }
+    }
+
+    // ---------------- GUI and queue ----------------
+
+    public void openMenu(Player player) { openKitMenu(player); }
+
+    private void openKitMenu(Player p) {
+        Inventory inv = Bukkit.createInventory(null, 54, Component.text(MENU_TITLE));
+        ItemStack red = named(Material.RED_STAINED_GLASS_PANE, "§c ");
+        ItemStack white = named(Material.WHITE_STAINED_GLASS_PANE, "§f ");
+        for (int i = 0; i < 54; i++) inv.setItem(i, (i / 9 == 0 || i / 9 == 5 || i % 9 == 0 || i % 9 == 8) ? red : white);
+        inv.setItem(4, item(Material.NETHER_STAR, "§c§lDUELS", "§7Выбери кит для поиска соперника", "§8ЛКМ — начать поиск"));
+        int[] slots = {10,11,12,13,14,15,16,19,20,21,22,23,24,25,28,29,30,31,32,33,34,37,38,39,40,41,42,43};
+        int index = 0;
+        for (KitData kit : kits.values()) {
+            if (index >= slots.length) break;
+            ItemStack icon = kit.icon == null ? new ItemStack(Material.NAME_TAG) : kit.icon.clone();
+            ItemMeta meta = icon.getItemMeta();
+            meta.setDisplayName("§c§l" + kit.id.toUpperCase(Locale.ROOT));
+            meta.setLore(List.of("§7Пользовательский кит", "", "§aЛКМ — найти соперника"));
+            icon.setItemMeta(meta);
+            inv.setItem(slots[index++], icon);
+        }
+        inv.setItem(45, item(Material.PAPER, "§f§lИнформация", "§7Доступно китов: §c" + kits.size()));
+        inv.setItem(49, item(Material.BARRIER, "§c§lЗакрыть", "§7Закрыть меню"));
+        inv.setItem(53, item(Material.REDSTONE, "§c§lОчереди", "§7Игроков в очередях: §f" + queueSize()));
+        p.openInventory(inv);
+    }
+
+    private void openKitEditor(Player player, KitData kit) {
+        String title = EDITOR_PREFIX + kit.id;
+        Inventory inv = Bukkit.createInventory(null, 54, Component.text(title));
+        ItemStack red = named(Material.RED_STAINED_GLASS_PANE, "§c ");
+        ItemStack white = named(Material.WHITE_STAINED_GLASS_PANE, "§f ");
+        for (int i = 0; i < 54; i++) inv.setItem(i, (i >= 45) ? red : null);
+        // 36 слотов инвентаря; декоративный ряд; 4 слота брони; отдельная иконка; закрыть.
+        if (kit.contents != null) for (int i = 0; i < Math.min(36, kit.contents.length); i++) inv.setItem(i, kit.contents[i]);
+        for (int i = 36; i < 45; i++) inv.setItem(i, (i % 2 == 0 ? red : white).clone());
+        if (kit.armor != null) for (int i = 0; i < Math.min(4, kit.armor.length); i++) inv.setItem(45 + i, kit.armor[i]);
+        inv.setItem(49, kit.icon == null ? item(Material.ITEM_FRAME, "§c§lИконка кита", "§7Положи сюда предмет-иконку") : kit.icon.clone());
+        inv.setItem(50, item(Material.PAPER, "§f§lПредметы кита", "§7Слоты 0–35"));
+        inv.setItem(51, item(Material.IRON_CHESTPLATE, "§f§lБроня", "§7Слоты 45–48"));
+        inv.setItem(52, item(Material.REDSTONE, "§c§lАвтосохранение", "§7Сохраняется при закрытии"));
+        inv.setItem(53, item(Material.BARRIER, "§c§lСохранить и выйти", "§7Сохранить изменения"));
+        editingKits.put(player.getUniqueId(), kit.id);
+        player.openInventory(inv);
+    }
+
+    @EventHandler
+    public void onInventoryClick(InventoryClickEvent event) {
+        if (!(event.getWhoClicked() instanceof Player player)) return;
+        String title = PlainTextComponentSerializer.plainText().serialize(event.getView().title());
+        if (title.equals(MENU_TITLE)) {
+            event.setCancelled(true);
+            int slot = event.getRawSlot();
+            if (slot == 49) { player.closeInventory(); return; }
+            int[] slots = {10,11,12,13,14,15,16,19,20,21,22,23,24,25,28,29,30,31,32,33,34,37,38,39,40,41,42,43};
+            int index = Arrays.binarySearch(slots, slot);
+            if (index >= 0 && index < kits.size()) {
+                String id = new ArrayList<>(kits.keySet()).get(index);
+                player.closeInventory(); joinQueue(player, id);
+            }
+            return;
+        }
+        if (title.startsWith(EDITOR_PREFIX)) {
+            String id = editingKits.get(player.getUniqueId());
+            KitData kit = id == null ? null : kits.get(id);
+            if (kit == null) { event.setCancelled(true); return; }
+            int raw = event.getRawSlot();
+            if (raw >= 54) { if (event.isShiftClick()) event.setCancelled(true); return; }
+            if (raw == 53) { event.setCancelled(true); saveEditor(player, kit); player.closeInventory(); return; }
+            if ((raw >= 36 && raw <= 44) || raw >= 50) { event.setCancelled(true); return; }
+            if (raw == 49) {
+                event.setCancelled(true);
+                if (event.isRightClick()) {
+                    kit.icon = null;
+                    player.getOpenInventory().getTopInventory().setItem(49, item(Material.ITEM_FRAME, "§c§lИконка кита", "§7Положи сюда предмет-иконку"));
+                } else {
+                    ItemStack cursor = event.getCursor();
+                    if (cursor != null && cursor.getType() != Material.AIR) {
+                        kit.icon = cursor.clone(); kit.icon.setAmount(1);
+                        player.getOpenInventory().getTopInventory().setItem(49, kit.icon.clone());
+                    }
+                }
+                saveKit(kit);
+                return;
+            }
+            if ((raw >= 0 && raw <= 35) || (raw >= 45 && raw <= 48)) {
+                Inventory editorInventory = event.getView().getTopInventory();
+                Bukkit.getScheduler().runTask(this, () -> saveEditor(player, kit, editorInventory));
+            }
+        }
+    }
+
+    @EventHandler
+    public void onInventoryClose(InventoryCloseEvent event) {
+        if (!(event.getPlayer() instanceof Player player)) return;
+        String id = editingKits.remove(player.getUniqueId());
+        if (id == null) return;
+        KitData kit = kits.get(id);
+        if (kit != null) saveEditor(player, kit, event.getInventory());
+    }
+
+    private void saveEditor(Player player, KitData kit) { saveEditor(player, kit, player.getOpenInventory().getTopInventory()); }
+    private void saveEditor(Player player, KitData kit, Inventory inv) {
+        ItemStack[] contents = new ItemStack[36];
+        for (int i = 0; i < 36; i++) { ItemStack item = inv.getItem(i); contents[i] = item == null || item.getType() == Material.AIR ? null : item.clone(); }
+        kit.contents = contents;
+        kit.armor = new ItemStack[4];
+        for (int i = 0; i < 4; i++) { ItemStack item = inv.getItem(45 + i); kit.armor[i] = item == null || item.getType() == Material.AIR ? null : item.clone(); }
+        ItemStack icon = inv.getItem(49);
+        if (icon != null && icon.getType() != Material.ITEM_FRAME && icon.getType() != Material.AIR) { kit.icon = icon.clone(); kit.icon.setAmount(1); }
+        saveKit(kit);
+    }
+
+    @EventHandler
+    public void onCompassInventoryMove(InventoryClickEvent event) {
+        if (event.getWhoClicked() instanceof Player player) {
+            if (event.getCurrentItem() != null && isCompass(event.getCurrentItem())) event.setCancelled(true);
+            if (event.getCursor() != null && isCompass(event.getCursor())) event.setCancelled(true);
+            int hotbar = event.getHotbarButton();
+            if (hotbar >= 0 && player.getInventory().getItem(hotbar) != null && isCompass(player.getInventory().getItem(hotbar))) event.setCancelled(true);
+        }
+    }
+
+    @EventHandler
+    public void onCompassSwap(org.bukkit.event.player.PlayerSwapHandItemsEvent event) {
+        if (isCompass(event.getMainHandItem()) || isCompass(event.getOffHandItem())) event.setCancelled(true);
+    }
+
+    @EventHandler
+    public void onCompassDrag(InventoryDragEvent event) {
+        ItemStack oldCursor = event.getOldCursor();
+        if (oldCursor != null && isCompass(oldCursor)) event.setCancelled(true);
+    }
+
+    @EventHandler
+    public void onDrop(PlayerDropItemEvent event) {
+        if (isCompass(event.getItemDrop().getItemStack())) {
+            event.setCancelled(true);
+            event.getPlayer().sendMessage("§cКомпас дуэлей нельзя выбросить.");
+        }
+    }
+
+    @EventHandler
+    public void onInteract(org.bukkit.event.player.PlayerInteractEvent event) {
+        if (event.getAction() != org.bukkit.event.block.Action.RIGHT_CLICK_AIR
+                && event.getAction() != org.bukkit.event.block.Action.RIGHT_CLICK_BLOCK) return;
+        ItemStack item = event.getItem();
+        if (item == null || !isCompass(item)) return;
+        event.setCancelled(true);
+        openKitMenu(event.getPlayer());
+    }
+
+    private void joinQueue(Player player, String kit) {
+        Party party = getParty(player);
+        List<UUID> members = party == null ? List.of(player.getUniqueId()) : new ArrayList<>(party.members);
+        if (party != null && !party.leader.equals(player.getUniqueId())) {
+            player.sendMessage("§cТолько лидер Party может запускать поиск.");
+            return;
+        }
+        if (members.stream().anyMatch(id -> Bukkit.getPlayer(id) == null)) {
+            player.sendMessage("§cВсе участники Party должны быть онлайн.");
+            return;
+        }
+        if (members.size() > 1 && partySpawnpoints.size() < members.size() * 2) {
+            player.sendMessage("§cНедостаточно Party-спавнов. Нужно минимум " + (members.size() * 2) + " точек.");
+            return;
+        }
+        removeFromQueues(player.getUniqueId());
+        for (UUID member : members) removeFromQueues(member);
+        QueueEntry entry = new QueueEntry(UUID.randomUUID(), kit, members, party != null);
+        Deque<QueueEntry> queue = queues.computeIfAbsent(kit, k -> new ArrayDeque<>());
+        QueueEntry opponent = null;
+        for (QueueEntry candidate : queue) {
+            if (!candidate.members.stream().anyMatch(members::contains)
+                    && candidate.party == entry.party
+                    && candidate.members.size() == entry.members.size()) {
+                opponent = candidate;
+                break;
+            }
+        }
+        if (opponent == null) {
+            queue.addLast(entry);
+            for (UUID id : members) {
+                Player member = Bukkit.getPlayer(id);
+                if (member != null) member.sendMessage("§dПоиск дуэли §7(" + kit + ")§d начат. §7/duel cancel — отмена.");
+            }
+            return;
+        }
+        queue.remove(opponent);
+        Arena arena = findArena(entry.party ? entry.members.size() * 2 : 2);
+        if (arena == null) {
+            queue.addFirst(opponent);
+            player.sendMessage("§cНет свободной арены с нужным количеством точек.");
+            return;
+        }
+        startMatch(arena, entry, opponent);
+    }
+
+    private void startMatch(Arena arena, QueueEntry a, QueueEntry b) {
+        arena.busy = true;
+        Match match = new Match(arena, new ArrayList<>(a.members), new ArrayList<>(b.members));
+        for (UUID id : match.teamA) activeMatches.put(id, match);
+        for (UUID id : match.teamB) activeMatches.put(id, match);
+        for (int i = 0; i < a.members.size(); i++) {
+            Location loc = a.party ? partySpawnpoints.get(i * 2 + 1) : arena.spawns.get(0);
+            Player p = Bukkit.getPlayer(a.members.get(i));
+            if (p != null) p.teleport(loc);
+        }
+        for (int i = 0; i < b.members.size(); i++) {
+            Location loc = b.party ? partySpawnpoints.get(i * 2 + 2) : arena.spawns.get(1);
+            Player p = Bukkit.getPlayer(b.members.get(i));
+            if (p != null) p.teleport(loc);
+        }
+        applyKit(a.kit, a.members);
+        applyKit(b.kit, b.members);
+        broadcastEntry(a, "§aМатч найден! Арена: §f" + arena.name);
+        broadcastEntry(b, "§aМатч найден! Арена: §f" + arena.name);
+        Bukkit.getScheduler().runTaskLater(this, () -> {
+            if (arena.busy && match.active) {
+                finishMatch(match, null, "§cМатч завершён по тайм-ауту.");
+            }
+        }, 20L * 60 * 10);
+    }
+
+    private void applyKit(String kitId, List<UUID> members) {
+        KitData kit = kits.get(kitId);
+        if (kit == null) return;
+        for (UUID id : members) {
+            Player player = Bukkit.getPlayer(id);
+            if (player == null) continue;
+            PlayerInventory inventory = player.getInventory();
+            inventory.clear();
+            ItemStack[] contents = kit.contents == null ? new ItemStack[36] : Arrays.copyOf(kit.contents, 36);
+            inventory.setStorageContents(contents);
+            inventory.setArmorContents(kit.armor == null ? new ItemStack[4] : Arrays.copyOf(kit.armor, 4));
+            player.updateInventory();
+        }
+    }
+
+    private Arena findArena(int requiredSpawns) {
+        return arenas.values().stream().filter(a -> !a.busy && a.spawns.size() >= requiredSpawns).findFirst().orElse(null);
+    }
+
+    private void removeFromQueues(UUID player) {
+        for (Deque<QueueEntry> queue : queues.values()) queue.removeIf(entry -> entry.members.contains(player));
+    }
+
+    private void broadcastEntry(QueueEntry entry, String message) {
+        for (UUID id : entry.members) {
+            Player p = Bukkit.getPlayer(id);
+            if (p != null) p.sendMessage(message);
+        }
+    }
+
+    // ---------------- Statistics and holograms ----------------
+
+    @EventHandler
+    public void onPlayerDeath(PlayerDeathEvent event) {
+        Player victim = event.getEntity();
+        PlayerStats victimStats = stats.computeIfAbsent(victim.getUniqueId(), id -> new PlayerStats());
+        victimStats.deaths++;
+        if (victim.getKiller() != null) {
+            Player killer = victim.getKiller();
+            stats.computeIfAbsent(killer.getUniqueId(), id -> new PlayerStats()).kills++;
+        }
+        saveStats();
+        refreshAllHolograms();
+
+        Match match = activeMatches.get(victim.getUniqueId());
+        if (match != null) {
+            Bukkit.getScheduler().runTask(this, () -> checkMatch(match));
+        }
+    }
+
+    @EventHandler
+    public void onQuit(PlayerQuitEvent event) {
+        Match match = activeMatches.get(event.getPlayer().getUniqueId());
+        if (match != null) Bukkit.getScheduler().runTask(this, () -> checkMatch(match));
+    }
+
+    private void checkMatch(Match match) {
+        if (!match.active) return;
+        boolean aAlive = teamAlive(match.teamA);
+        boolean bAlive = teamAlive(match.teamB);
+        if (!aAlive && bAlive) finishMatch(match, match.teamB, "§aКоманда B победила!");
+        else if (!bAlive && aAlive) finishMatch(match, match.teamA, "§aКоманда A победила!");
+        else if (!aAlive && !bAlive) finishMatch(match, null, "§eНичья!");
+    }
+
+    private boolean teamAlive(List<UUID> team) {
+        for (UUID id : team) {
+            Player player = Bukkit.getPlayer(id);
+            if (player != null && !player.isDead()) return true;
+        }
+        return false;
+    }
+
+    private void finishMatch(Match match, List<UUID> winners, String message) {
+        if (!match.active) return;
+        match.active = false;
+        match.arena.busy = false;
+        for (UUID id : match.teamA) {
+            Player p = Bukkit.getPlayer(id);
+            if (p != null) p.sendMessage(message);
+            activeMatches.remove(id);
+        }
+        for (UUID id : match.teamB) {
+            Player p = Bukkit.getPlayer(id);
+            if (p != null) p.sendMessage(message);
+            activeMatches.remove(id);
+        }
+        if (winners != null) {
+            for (UUID id : winners) stats.computeIfAbsent(id, key -> new PlayerStats()).wins++;
+            saveStats();
+            refreshAllHolograms();
+        }
+    }
+
+    private void showTop(CommandSender sender, String type) {
+        List<Map.Entry<UUID, PlayerStats>> sorted = stats.entrySet().stream()
+                .sorted((a, b) -> Integer.compare(statValue(b.getValue(), type), statValue(a.getValue(), type)))
+                .limit(10).toList();
+        String label = switch (type) {
+            case "kills" -> "УБИЙСТВА";
+            case "deaths" -> "СМЕРТИ";
+            default -> "ПОБЕДЫ";
+        };
+        sender.sendMessage("§d§lТОП-10 §8— §f" + label);
+        if (sorted.isEmpty()) {
+            sender.sendMessage("§7Статистика пока пуста.");
+            return;
+        }
+        int place = 1;
+        for (Map.Entry<UUID, PlayerStats> entry : sorted) {
+            OfflinePlayer player = Bukkit.getOfflinePlayer(entry.getKey());
+            String name = player.getName() == null ? "Unknown" : player.getName();
+            sender.sendMessage("§d#" + place++ + " §f" + name + " §8— §a" + statValue(entry.getValue(), type));
+        }
+    }
+
+    private int statValue(PlayerStats st, String type) {
+        return switch (type) {
+            case "kills" -> st.kills;
+            case "deaths" -> st.deaths;
+            default -> st.wins;
+        };
+    }
+
+    private void loadStats() {
+        if (!statsFile.exists()) return;
+        YamlConfiguration yml = YamlConfiguration.loadConfiguration(statsFile);
+        ConfigurationSection root = yml.getConfigurationSection("players");
+        if (root == null) return;
+        for (String key : root.getKeys(false)) {
+            try {
+                UUID id = UUID.fromString(key);
+                PlayerStats st = new PlayerStats();
+                st.kills = yml.getInt("players." + key + ".kills");
+                st.deaths = yml.getInt("players." + key + ".deaths");
+                st.wins = yml.getInt("players." + key + ".wins");
+                stats.put(id, st);
+            } catch (IllegalArgumentException ignored) {}
+        }
+    }
+
+    private void saveStats() {
+        if (statsFile == null) return;
+        YamlConfiguration yml = new YamlConfiguration();
+        for (Map.Entry<UUID, PlayerStats> e : stats.entrySet()) {
+            String path = "players." + e.getKey();
+            yml.set(path + ".kills", e.getValue().kills);
+            yml.set(path + ".deaths", e.getValue().deaths);
+            yml.set(path + ".wins", e.getValue().wins);
+        }
+        try { yml.save(statsFile); } catch (IOException ex) { getLogger().severe("Could not save stats.yml: " + ex.getMessage()); }
+    }
+
+    private void loadHolograms() {
+        if (!hologramsFile.exists()) return;
+        YamlConfiguration yml = YamlConfiguration.loadConfiguration(hologramsFile);
+        ConfigurationSection root = yml.getConfigurationSection("holograms");
+        if (root == null) return;
+        for (String id : root.getKeys(false)) {
+            Location loc = yml.getLocation("holograms." + id + ".location");
+            if (loc != null) {
+                holograms.put(id, loc);
+                String type = yml.getString("holograms." + id + ".type", "kills");
+                Bukkit.getScheduler().runTask(this, () -> refreshHologram(id, type));
+            }
+        }
+    }
+
+    private void saveHolograms() {
+        if (hologramsFile == null) return;
+        YamlConfiguration yml = new YamlConfiguration();
+        for (Map.Entry<String, Location> e : holograms.entrySet()) {
+            yml.set("holograms." + e.getKey() + ".location", e.getValue());
+            yml.set("holograms." + e.getKey() + ".type", hologramTypeFromId(e.getKey()));
+        }
+        try { yml.save(hologramsFile); } catch (IOException ex) { getLogger().severe("Could not save holograms.yml: " + ex.getMessage()); }
+    }
+
+    private String hologramTypeFromId(String id) {
+        if (id.startsWith("deaths_")) return "deaths";
+        if (id.startsWith("wins_")) return "wins";
+        return "kills";
+    }
+
+    private void refreshAllHolograms() {
+        for (String id : holograms.keySet()) refreshHologram(id, hologramTypeFromId(id));
+    }
+
+    private String hologramTypeName(String type) {
+        return switch (type) {
+            case "deaths" -> "смертей";
+            case "wins" -> "побед";
+            default -> "убийств";
+        };
+    }
+
+    private void refreshHologram(String id, String type) {
+        Location baseLoc = holograms.get(id);
+        if (baseLoc == null || baseLoc.getWorld() == null) return;
+        List<UUID> old = hologramEntities.remove(id);
+        if (old != null) for (UUID entityId : old) {
+            Entity entity = Bukkit.getEntity(entityId);
+            if (entity != null) entity.remove();
+        }
+        List<Map.Entry<UUID, PlayerStats>> sorted = stats.entrySet().stream()
+                .sorted((a, b) -> Integer.compare(statValue(b.getValue(), type), statValue(a.getValue(), type)))
+                .limit(10).toList();
+        String heading = switch (type) {
+            case "deaths" -> "§c§lТОП СМЕРТЕЙ";
+            case "wins" -> "§6§lТОП ПОБЕД";
+            default -> "§a§lТОП УБИЙСТВ";
+        };
+        List<String> lines = new ArrayList<>();
+        lines.add("§5§lDUELS");
+        lines.add(heading);
+        if (sorted.isEmpty()) lines.add("§7Пока нет статистики");
+        else {
+            int pos = 1;
+            for (Map.Entry<UUID, PlayerStats> e : sorted) {
+                OfflinePlayer player = Bukkit.getOfflinePlayer(e.getKey());
+                String name = player.getName() == null ? "Unknown" : player.getName();
+                lines.add("§d" + pos++ + ". §f" + name + " §8- §e" + statValue(e.getValue(), type));
+            }
+        }
+        List<UUID> ids = new ArrayList<>();
+        // Создаём стойки снизу вверх: нижняя строка находится прямо на точке установки.
+        for (int i = lines.size() - 1; i >= 0; i--) {
+            final String line = lines.get(i);
+            Location loc = baseLoc.clone().add(0, (lines.size() - i - 1) * 0.25, 0);
+            ArmorStand stand = baseLoc.getWorld().spawn(loc, ArmorStand.class, as -> {
+                as.setVisible(false);
+                as.setInvisible(true);
+                as.setMarker(true);
+                as.setGravity(false);
+                as.setInvulnerable(true);
+                as.setCollidable(false);
+                as.setCustomNameVisible(true);
+                as.setCustomName(line);
+                as.setPersistent(true);
+            });
+            ids.add(stand.getUniqueId());
+        }
+        hologramEntities.put(id, ids);
+    }
+
+    // ---------------- Persistence ----------------
+
+    private void loadArenas() {
+        if (!arenasFile.exists()) return;
+        YamlConfiguration yml = YamlConfiguration.loadConfiguration(arenasFile);
+        ConfigurationSection root = yml.getConfigurationSection("arenas");
+        if (root == null) return;
+        for (String name : root.getKeys(false)) {
+            Arena arena = new Arena(name);
+            List<?> list = root.getList(name + ".spawns", List.of());
+            for (Object value : list) if (value instanceof Location loc) arena.spawns.add(loc);
+            arenas.put(name, arena);
+        }
+    }
+
+    private void saveArenas() {
+        YamlConfiguration yml = new YamlConfiguration();
+        for (Arena arena : arenas.values()) yml.set("arenas." + arena.name + ".spawns", arena.spawns);
+        try { yml.save(arenasFile); } catch (IOException ex) { getLogger().severe("Could not save arenas.yml: " + ex.getMessage()); }
+    }
+
+    private void loadPartySpawnpoints() {
+        if (!partySpawnsFile.exists()) return;
+        YamlConfiguration yml = YamlConfiguration.loadConfiguration(partySpawnsFile);
+        ConfigurationSection sec = yml.getConfigurationSection("spawnpoints");
+        if (sec == null) return;
+        for (String key : sec.getKeys(false)) {
+            Location loc = yml.getLocation("spawnpoints." + key);
+            if (loc != null) try { partySpawnpoints.put(Integer.parseInt(key), loc); } catch (NumberFormatException ignored) {}
+        }
+    }
+
+    private void savePartySpawnpoints() {
+        YamlConfiguration yml = new YamlConfiguration();
+        for (Map.Entry<Integer, Location> e : partySpawnpoints.entrySet()) yml.set("spawnpoints." + e.getKey(), e.getValue());
+        try { yml.save(partySpawnsFile); } catch (IOException ex) { getLogger().severe("Could not save party-spawns.yml: " + ex.getMessage()); }
+    }
+
+    private void loadKits() {
+        File[] files = kitsFolder.listFiles((dir, name) -> name.endsWith(".yml"));
+        if (files == null) return;
+        for (File file : files) {
+            YamlConfiguration yml = YamlConfiguration.loadConfiguration(file);
+            String id = file.getName().substring(0, file.getName().length() - 4);
+            KitData kit = new KitData(id);
+            kit.icon = yml.getItemStack("icon");
+            List<?> content = yml.getList("contents", List.of());
+            for (int i = 0; i < Math.min(36, content.size()); i++) if (content.get(i) instanceof ItemStack stack) kit.contents[i] = stack;
+            List<?> armor = yml.getList("armor", List.of());
+            for (int i = 0; i < Math.min(4, armor.size()); i++) if (armor.get(i) instanceof ItemStack stack) kit.armor[i] = stack;
+            kits.put(id, kit);
+        }
+    }
+    private void saveKit(KitData kit) {
+        YamlConfiguration yml = new YamlConfiguration();
+        yml.set("icon", kit.icon); yml.set("contents", Arrays.asList(kit.contents)); yml.set("armor", Arrays.asList(kit.armor));
+        try { yml.save(new File(kitsFolder, kit.id + ".yml")); } catch (IOException ex) { getLogger().severe("Could not save kit " + kit.id + ": " + ex.getMessage()); }
+    }
+
+    // ---------------- Helpers ----------------
+
+    private ItemStack createCompass() {
+        ItemStack item = item(Material.COMPASS, COMPASS_TAG, "§7ПКМ — открыть меню дуэлей");
+        ItemMeta meta = item.getItemMeta();
+        meta.setUnbreakable(true);
+        item.setItemMeta(meta);
+        return item;
+    }
+
+    private boolean isCompass(ItemStack item) {
+        return item.getType() == Material.COMPASS && item.hasItemMeta()
+                && Objects.equals(item.getItemMeta().getDisplayName(), COMPASS_TAG);
+    }
+
+    private ItemStack item(Material material, String name, String... lore) {
+        ItemStack stack = new ItemStack(material);
+        ItemMeta meta = stack.getItemMeta();
+        meta.setDisplayName(name);
+        meta.setLore(Arrays.asList(lore));
+        stack.setItemMeta(meta);
+        return stack;
+    }
+
+    private ItemStack named(Material material, String name) { return item(material, name); }
+
+    private boolean playerOnly(CommandSender sender) { sender.sendMessage("§cЭта команда доступна только игроку."); return true; }
+    private boolean noPermission(CommandSender sender) { sender.sendMessage("§cНедостаточно прав."); return true; }
+    private int queueSize() { return queues.values().stream().mapToInt(Deque::size).sum(); }
+
+    private Party getParty(Player p) {
+        UUID id = partyByPlayer.get(p.getUniqueId());
+        return id == null ? null : parties.get(id);
+    }
+    private Party getPartyByPlayer(UUID player) {
+        UUID id = partyByPlayer.get(player);
+        return id == null ? null : parties.get(id);
+    }
+    private UUID findOnlineUuid(String name) {
+        Player p = Bukkit.getPlayerExact(name);
+        return p == null ? null : p.getUniqueId();
+    }
+    private void broadcast(Party party, String message) {
+        for (UUID id : party.members) {
+            Player member = Bukkit.getPlayer(id);
+            if (member != null) member.sendMessage(message);
+        }
+    }
+    private void leaveParty(Player p) {
+        Party party = getParty(p);
+        if (party == null) { p.sendMessage("§cТы не состоишь в Party."); return; }
+        party.members.remove(p.getUniqueId());
+        partyByPlayer.remove(p.getUniqueId());
+        if (party.members.isEmpty()) parties.remove(party.id);
+        else if (party.leader.equals(p.getUniqueId())) {
+            party.leader = party.members.iterator().next();
+            broadcast(party, "§eЛидерство передано новому участнику.");
+        }
+        p.sendMessage("§7Ты вышел из Party.");
+    }
+
+    @Override
+    public List<String> onTabComplete(CommandSender sender, Command command, String alias, String[] args) {
+        if (command.getName().equalsIgnoreCase("duel")) {
+            if (args.length == 1) return filter(List.of("menu", "cancel", "stats", "top", "hologram", "give", "compas", "kit", "create", "addspawnpoint", "delete", "list"), args[0], true);
+            if (args.length == 2 && args[0].equalsIgnoreCase("top")) return filter(List.of("kills", "deaths", "wins"), args[1], true);
+            if (args.length == 2 && args[0].equalsIgnoreCase("hologram")) return sender.isOp() ? filter(List.of("add", "delete"), args[1], true) : List.of();
+            if (args.length == 3 && args[0].equalsIgnoreCase("hologram") && args[1].equalsIgnoreCase("add")) return sender.isOp() ? filter(List.of("kills", "deaths", "wins"), args[2], true) : List.of();
+            if (args.length == 2 && args[0].equalsIgnoreCase("give")) return sender.isOp() ? filter(List.of("compass"), args[1], true) : List.of();
+            if (args.length == 2 && args[0].equalsIgnoreCase("compas")) return filter(List.of("del"), args[1], true);
+            if (args.length == 2 && args[0].equalsIgnoreCase("kit")) return sender.isOp() ? filter(List.of("create", "open", "delete", "list"), args[1], true) : List.of();
+            if (args.length == 3 && args[0].equalsIgnoreCase("kit") && List.of("open", "delete").contains(args[1].toLowerCase(Locale.ROOT))) return sender.isOp() ? filter(new ArrayList<>(kits.keySet()), args[2], true) : List.of();
+            if (args.length == 3 && args[0].equalsIgnoreCase("kit") && args[1].equalsIgnoreCase("create")) return sender.isOp() ? List.of("<название>") : List.of();
+            if (args.length == 2 && args[0].equalsIgnoreCase("create")) return sender.isOp() ? List.of("area") : List.of();
+            if (args.length == 3 && (args[0].equalsIgnoreCase("create") || args[0].equalsIgnoreCase("delete"))) return sender.isOp() ? List.of("<название>") : List.of();
+            if (args.length == 2 && args[0].equalsIgnoreCase("addspawnpoint")) return sender.isOp() ? new ArrayList<>(arenas.keySet()) : List.of();
+        } else {
+            if (args.length == 1) return filter(List.of("create", "invite", "accept", "deny", "kick", "promote", "leave", "list", "disband", "add", "removespawnpoint"), args[0], true);
+            if (args.length == 2 && List.of("invite","accept","deny","kick","promote").contains(args[0].toLowerCase(Locale.ROOT)))
+                return Bukkit.getOnlinePlayers().stream().map(Player::getName).filter(n -> n.toLowerCase(Locale.ROOT).startsWith(args[1].toLowerCase(Locale.ROOT))).toList();
+            if (args.length == 2 && args[0].equalsIgnoreCase("add")) return List.of("spawnpoint");
+            if (args.length == 3 && args[0].equalsIgnoreCase("add") && args[1].equalsIgnoreCase("spawnpoint")) return List.of("1", "2", "3", "4");
+        }
+        return List.of();
+    }
+
+    private List<String> filter(List<String> values, String input, boolean allowed) {
+        if (!allowed) return List.of();
+        return values.stream().filter(s -> s.toLowerCase(Locale.ROOT).startsWith(input.toLowerCase(Locale.ROOT))).toList();
+    }
+
+    private static final class PlayerStats {
+        int kills, deaths, wins;
+    }
+    private static final class Match {
+        final Arena arena;
+        final List<UUID> teamA, teamB;
+        boolean active = true;
+        Match(Arena arena, List<UUID> teamA, List<UUID> teamB) {
+            this.arena = arena; this.teamA = teamA; this.teamB = teamB;
+        }
+    }
+    private static final class KitData {
+        final String id; ItemStack icon; ItemStack[] contents = new ItemStack[36]; ItemStack[] armor = new ItemStack[4];
+        KitData(String id) { this.id = id; }
+    }
+    private static final class Arena {
+        final String name;
+        final List<Location> spawns = new ArrayList<>();
+        boolean busy;
+        Arena(String name) { this.name = name; }
+    }
+    private static final class Party {
+        final UUID id = UUID.randomUUID();
+        UUID leader;
+        final LinkedHashSet<UUID> members = new LinkedHashSet<>();
+        final Map<UUID, Long> invites = new HashMap<>();
+        Party(UUID leader) { this.leader = leader; members.add(leader); }
+    }
+    private record QueueEntry(UUID id, String kit, List<UUID> members, boolean party) {}
+}
